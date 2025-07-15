@@ -1,5 +1,4 @@
-Use the clean branch**
-
+---------------------
 There are two models:
 
 - model1.py is the work in progress and is the MAIN model which has the algorithm implemented from the paper;
