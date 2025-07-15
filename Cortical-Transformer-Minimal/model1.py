@@ -28,7 +28,8 @@ class GPTConfig:
     n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.1
-    # --- Dynamic Params ---
+
+    # Dynamic Params
     tau_att: float = 2.0
     tau_v: float = 2.0
     dt: float = 0.1
@@ -68,7 +69,6 @@ class DynamicCausalSelfAttention(nn.Module):
         self.tau_alpha = config.tau_att
         self.tau_nu = config.tau_v
 
-        # Causal mask buffer
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
@@ -85,7 +85,6 @@ class DynamicCausalSelfAttention(nn.Module):
                 - alpha_state: Initial attention state tensor (zeros).
                 - nu_state: Initial value state tensor (zeros).
         """
-        # Initial attention (alpha) and value (nu) states
         alpha = torch.zeros(B, self.n_head, T_ctx, T_ctx, device=device, dtype=torch.float32)
         nu = torch.zeros(B, self.n_head, T_ctx, self.head_size, device=device, dtype=torch.float32)
         return alpha, nu
@@ -105,14 +104,13 @@ class DynamicCausalSelfAttention(nn.Module):
         q = q.view(B, T_ctx, self.n_head, self.head_size).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T_ctx, self.n_head, self.head_size).transpose(1, 2) # (B, nh, T, hs)
 
-        # Attention calculation
+        
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:,:,:T_ctx,:T_ctx] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
-        att = torch.nan_to_num(att) # Prevent NaNs
+        att = torch.nan_to_num(att)
         att = self.attn_dropout(att)
 
-        # Output calculation
         y = (att @ v).transpose(1, 2).contiguous().view(B, T_ctx, C) # (B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
@@ -135,7 +133,6 @@ class DynamicCausalSelfAttention(nn.Module):
         dt = self.config.dt
         tau_alpha, tau_nu = self.tau_alpha, self.tau_nu
 
-        # Calculate target values (instantaneous Q, K, V, attention)
         q, k, nu_target = self.c_attn(x).split(self.config.n_embd, dim=2)
         k = k.view(B, T_ctx, self.n_head, self.head_size).transpose(1, 2)
         q = q.view(B, T_ctx, self.n_head, self.head_size).transpose(1, 2)
@@ -145,7 +142,6 @@ class DynamicCausalSelfAttention(nn.Module):
         att_raw_target = att_raw_target.masked_fill(self.bias[:, :, :T_ctx, :T_ctx] == 0, float('-inf'))
         alpha_target = F.softmax(att_raw_target, dim=-1)
         alpha_target = torch.nan_to_num(alpha_target)
-
 
         delta_nu = (1. / tau_nu) * (-current_nu + nu_target)
         nu_breve = torch.nan_to_num(current_nu + tau_nu * delta_nu)
@@ -158,7 +154,6 @@ class DynamicCausalSelfAttention(nn.Module):
 
         alpha_breve_dropped = self.attn_dropout(alpha_breve)
 
-        # Output: prospective_attention @ prospective_value
         y = (alpha_breve_dropped @ nu_breve).transpose(1, 2).contiguous().view(B, T_ctx, C)
         y = self.resid_dropout(self.c_proj(y))
 
@@ -219,8 +214,8 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Performs the standard static forward pass through the block."""
-        x = x + self.attn(self.ln_1(x)) # Residual connection + Attention
-        x = x + self.mlp(self.ln_2(x))  # Residual connection + MLP
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
     def step(self, x: torch.Tensor, alpha_state: torch.Tensor, nu_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -239,8 +234,8 @@ class Block(nn.Module):
                 - next_nu: Updated value state.
         """
         attn_out, next_alpha, next_nu = self.attn.step(self.ln_1(x), alpha_state, nu_state)
-        x = x + attn_out # Apply residual connection for attention
-        x = x + self.mlp.step(self.ln_2(x)) # Apply residual connection for MLP
+        x = x + attn_out
+        x = x + self.mlp.step(self.ln_2(x))
         return x, next_alpha, next_nu
 
 class GPT(nn.Module):
@@ -263,35 +258,29 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None and config.block_size is not None
         self.config = config
-        # --- Store num_classes ---
+        
         self.num_classes = num_classes
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            # drop = nn.Dropout(config.dropout), # Consider adding dropout after embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
 
-        # --- Conditional Head Creation ---
+        
         if self.num_classes is not None:
-            # --- Classification Mode ---
             print(f"Model configured for Classification with {self.num_classes} classes.")
-            self.lm_head = None # Not used for classification
-            # Create a linear layer mapping final embedding to class scores
+            self.lm_head = None
             self.classification_head = nn.Linear(config.n_embd, self.num_classes)
-            # Initialize weights for the new head
             self._init_weights(self.classification_head)
         else:
-            # --- Language Modeling Mode ---
             print("Model configured for Language Modeling.")
-            # Standard LM head mapping to vocabulary size
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
             self.classification_head = None
             self.transformer.wte.weight = self.lm_head.weight
 
-        self.apply(self._init_weights) # Apply weight initialization
+        self.apply(self._init_weights)
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Model initialized: {n_params/1e6:.2f}M parameters")
@@ -300,7 +289,6 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         """Initializes weights for linear and embedding layers."""
         if isinstance(module, nn.Linear):
-             # Check if the layer exists before initializing
             if module is not None and hasattr(module, 'weight'):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None: nn.init.zeros_(module.bias)
@@ -325,26 +313,23 @@ class GPT(nn.Module):
 
     def _get_logits_and_loss(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Calculates final logits and loss based on task type."""
-        if self.num_classes is not None: # --- Classification Task ---
+        if self.num_classes is not None:
             assert self.classification_head is not None, "num_classes was set but classification_head is None"
-            # Use embedding of the last token for classification prediction
-            class_token_embedding = x[:, -1, :] # Shape: (B, C)
-            logits = self.classification_head(class_token_embedding) # Shape: (B, num_classes)
+            class_token_embedding = x[:, -1, :]
+            logits = self.classification_head(class_token_embedding)
             loss = None
             if targets is not None:
-                # Targets should have shape (B,) for CrossEntropyLoss with logits (B, num_classes)
                 loss = F.cross_entropy(logits.view(-1, self.num_classes), targets.view(-1))
-        else: # --- Language Modeling Task ---
+        else:
             assert self.lm_head is not None, "num_classes is None but lm_head is None"
             loss = None
-            if targets is not None: # Training/Validation
-                logits = self.lm_head(x) # Shape: (B, T_ctx, V)
-                # Align targets if input was cropped by _prepare_input
+            if targets is not None:
+                logits = self.lm_head(x)
                 if targets.size(1) != logits.size(1):
                      targets = targets[:, -logits.size(1):]
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            else: # Inference (like generate)
-                logits = self.lm_head(x[:, [-1], :]) # Shape: (B, 1, V)
+            else:
+                logits = self.lm_head(x[:, [-1], :])
         return logits, loss
 
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -392,10 +377,8 @@ class GPT(nn.Module):
         self.train()
         return idx
 
-    # configure_optimizers method remains largely the same, ensure it handles None heads
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        # Filter out None parameters just in case
         param_dict = {pn: p for pn, p in param_dict.items() if p is not None}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
